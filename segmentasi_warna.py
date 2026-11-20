@@ -17,13 +17,11 @@ DEFAULTS = {
     "biru": {"center": 115, "width": 15, "smin": 100, "vmin": 50},
 }
 
-CONTROL_WINDOW = "Kontrol HSV"
+WINDOW = "Kamera & Tuning HSV"
 HUE_MAX = 179
 WIDTH_MAX = 89
-
-
-def noop(_value):
-    pass
+TAB_HEIGHT = 36
+TABS = ["Kamera", "Tuning HSV"]
 
 
 def hsv_ranges(center, width, smin, vmin):
@@ -55,22 +53,29 @@ def find_objects(mask, min_area):
     return [c for c in contours if cv2.contourArea(c) >= min_area]
 
 
+def select_nearest(contours, frame_center):
+    if not contours:
+        return []
+    cx, cy = frame_center
+    best = min(
+        contours,
+        key=lambda c: (contour_center(c)[0] - cx) ** 2 + (contour_center(c)[1] - cy) ** 2,
+    )
+    return [best]
+
+
+def mask_from_contours(contours, shape):
+    mask = np.zeros(shape, dtype=np.uint8)
+    if contours:
+        cv2.drawContours(mask, contours, -1, 255, -1)
+    return mask
+
+
 def draw_objects(frame, contours, label):
     color = COLORS[label]
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        area = int(cv2.contourArea(contour))
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(
-            frame,
-            f"{label} {area}px",
-            (x, max(y - 8, 18)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
 
 
 def contour_center(contour):
@@ -119,6 +124,11 @@ def process(frame, min_area, kernel, red_ranges, blue_ranges):
 
     red_objects = find_objects(red_mask, min_area)
     blue_objects = find_objects(blue_mask, min_area)
+    frame_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+    red_objects = select_nearest(red_objects, frame_center)
+    blue_objects = select_nearest(blue_objects, frame_center)
+    red_mask = mask_from_contours(red_objects, frame.shape[:2])
+    blue_mask = mask_from_contours(blue_objects, frame.shape[:2])
 
     overlay = frame.copy()
     overlay[red_mask > 0] = COLORS["MERAH"]
@@ -142,11 +152,9 @@ def process(frame, min_area, kernel, red_ranges, blue_ranges):
         midpoint_info = "Titik tengah: butuh 2 objek"
 
     info = [
-        f"Merah: {len(red_objects)} objek",
-        f"Biru : {len(blue_objects)} objek",
         f"Cakupan: {ratio:.1f}%",
         midpoint_info,
-        "q/ESC keluar | s simpan | m mask | p simpan HSV",
+        "q/ESC keluar | s simpan | m/tab ganti | p simpan HSV",
     ]
     start_y = result.shape[0] - 12 - (len(info) - 1) * 26
     for i, text in enumerate(info):
@@ -187,26 +195,180 @@ def save_config(path, config):
     print(f"Konfigurasi HSV disimpan: {path}")
 
 
-def create_controls(config):
-    cv2.namedWindow(CONTROL_WINDOW, cv2.WINDOW_NORMAL)
-    for prefix, key in (("Merah", "merah"), ("Biru", "biru")):
-        values = config[key]
-        cv2.createTrackbar(f"{prefix} H tengah", CONTROL_WINDOW, values["center"], HUE_MAX, noop)
-        cv2.createTrackbar(f"{prefix} H lebar", CONTROL_WINDOW, values["width"], WIDTH_MAX, noop)
-        cv2.createTrackbar(f"{prefix} S min", CONTROL_WINDOW, values["smin"], 255, noop)
-        cv2.createTrackbar(f"{prefix} V min", CONTROL_WINDOW, values["vmin"], 255, noop)
+SLIDER_DEFS = [
+    ("Merah", "merah", [
+        ("H tengah", "center", HUE_MAX),
+        ("H lebar", "width", WIDTH_MAX),
+        ("S min", "smin", 255),
+        ("V min", "vmin", 255),
+    ]),
+    ("Biru", "biru", [
+        ("H tengah", "center", HUE_MAX),
+        ("H lebar", "width", WIDTH_MAX),
+        ("S min", "smin", 255),
+        ("V min", "vmin", 255),
+    ]),
+]
 
 
-def read_controls():
-    config = {}
-    for prefix, key in (("Merah", "merah"), ("Biru", "biru")):
-        config[key] = {
-            "center": cv2.getTrackbarPos(f"{prefix} H tengah", CONTROL_WINDOW),
-            "width": cv2.getTrackbarPos(f"{prefix} H lebar", CONTROL_WINDOW),
-            "smin": cv2.getTrackbarPos(f"{prefix} S min", CONTROL_WINDOW),
-            "vmin": cv2.getTrackbarPos(f"{prefix} V min", CONTROL_WINDOW),
-        }
-    return config
+def probe_cameras(max_index=8):
+    found = []
+    for i in range(max_index + 1):
+        cap = cv2.VideoCapture(i)
+        if cap is not None and cap.isOpened():
+            found.append(i)
+        if cap is not None:
+            cap.release()
+    return found
+
+
+def draw_tuning_panel(width, height, config, scroll_y=0, cam_index=0, cameras=None):
+    if cameras is None:
+        cameras = []
+    panel = np.full((height, width, 3), 35, dtype=np.uint8)
+    pad = 20
+    col_w = max((width - pad * 3) // 2, 220)
+    rects = []
+    cam_rects = []
+    content_bottom = 0
+
+    cam_y = 20 - scroll_y
+    if -30 < cam_y < height:
+        cv2.putText(panel, "Kamera:", (pad, cam_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1, cv2.LINE_AA)
+    bx = pad + 90
+    cam_label = str(cam_index)
+    for idx in cameras:
+        label = str(idx)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        bw, bh = max(tw + 18, 36), 26
+        rect = (bx, cam_y, bx + bw, cam_y + bh)
+        cam_rects.append((rect, idx))
+        if -30 < cam_y < height + 30:
+            selected = idx == cam_index
+            bg = (80, 160, 80) if selected else (70, 70, 70)
+            border = (220, 255, 220) if selected else (140, 140, 140)
+            cv2.rectangle(panel, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
+            cv2.rectangle(panel, (rect[0], rect[1]), (rect[2], rect[3]), border, 1)
+            tx = rect[0] + (bw - tw) // 2
+            ty = rect[1] + (bh + th) // 2 - 2
+            cv2.putText(panel, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        bx += bw + 8
+    if not cameras and -30 < cam_y < height:
+        cv2.putText(panel, "(tidak terdeteksi)", (bx, cam_y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+    content_bottom = max(content_bottom, cam_y + 34 + scroll_y)
+
+    col_start = cam_y + 44
+    for col, (title, key, items) in enumerate(SLIDER_DEFS):
+        x0 = pad + col * (col_w + pad)
+        y = col_start
+        title_color = COLORS["MERAH"] if key == "merah" else COLORS["BIRU"]
+        if -30 < y < height:
+            cv2.putText(panel, title, (x0, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.8, title_color, 2, cv2.LINE_AA)
+        y += 30
+        for label, field, maxv in items:
+            val = int(config[key][field])
+            track_x0 = x0 + 90
+            track_x1 = x0 + col_w - 70
+            if track_x1 < track_x0 + 40:
+                track_x1 = track_x0 + 40
+            track_y = y + 10
+            rect = (track_x0, track_y - 8, track_x1, track_y + 8)
+            rects.append((rect, key, field, maxv))
+            if -20 < track_y < height + 20:
+                cv2.putText(panel, label, (x0, track_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
+                cv2.rectangle(panel, (track_x0, track_y - 3), (track_x1, track_y + 3), (90, 90, 90), -1)
+                t = 0.0 if maxv == 0 else val / maxv
+                kx = int(track_x0 + t * (track_x1 - track_x0))
+                cv2.rectangle(panel, (track_x0, track_y - 3), (kx, track_y + 3), title_color, -1)
+                cv2.circle(panel, (kx, track_y), 7, (240, 240, 240), -1)
+                cv2.putText(panel, str(val), (track_x1 + 8, track_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 44
+        sy = y + 10
+        if -20 < sy < height + 20:
+            cv2.putText(
+                panel,
+                f"center={config[key]['center']} width={config[key]['width']} s>={config[key]['smin']} v>={config[key]['vmin']}",
+                (x0, sy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (180, 180, 180),
+                1,
+                cv2.LINE_AA,
+            )
+        content_bottom = max(content_bottom, y + 30 + scroll_y)
+    hint = "Pilih kamera di atas | Scroll/drag untuk pan | p simpan | m/tab ganti | q keluar"
+    cv2.putText(panel, hint, (pad, max(height - 20, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+    max_scroll = max(0, content_bottom - (height - 40))
+    if max_scroll > 0:
+        bar_h = max(int(height * height / max(height + max_scroll, 1)), 30)
+        bar_y = int((height - bar_h) * (scroll_y / max_scroll)) if max_scroll else 0
+        cv2.rectangle(panel, (width - 8, bar_y), (width - 3, bar_y + bar_h), (120, 120, 120), -1)
+    return panel, rects, cam_rects, max_scroll
+
+
+def draw_tabs(frame, active_tab):
+    h, w = frame.shape[:2]
+    tab_w = w // len(TABS)
+    bar = np.full((TAB_HEIGHT, w, 3), 45, dtype=np.uint8)
+    for i, name in enumerate(TABS):
+        x0 = i * tab_w
+        x1 = w if i == len(TABS) - 1 else (i + 1) * tab_w
+        color = (80, 160, 80) if i == active_tab else (70, 70, 70)
+        cv2.rectangle(bar, (x0 + 1, 1), (x1 - 2, TAB_HEIGHT - 2), color, -1)
+        cv2.rectangle(bar, (x0 + 1, 1), (x1 - 2, TAB_HEIGHT - 2), (200, 200, 200), 1)
+        text_size = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        tx = x0 + (x1 - x0 - text_size[0]) // 2
+        ty = (TAB_HEIGHT + text_size[1]) // 2 - 2
+        cv2.putText(bar, name, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return np.vstack([bar, frame])
+
+
+def make_tab_callback(state):
+    def on_mouse(event, x, y, flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN and y < TAB_HEIGHT:
+            tab_w = state["width"] // len(TABS)
+            state["active_tab"] = min(x // max(tab_w, 1), len(TABS) - 1)
+            state["dragging"] = None
+            state["panning"] = None
+            return
+        if state.get("active_tab") != 1:
+            return
+        py = y - TAB_HEIGHT
+        config = state["config"]
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for rect, idx in state.get("cam_rects", []):
+                x0, y0, x1, y1 = rect
+                if x0 <= x <= x1 and y0 <= py <= y1:
+                    state["requested_source"] = idx
+                    state["dragging"] = None
+                    state["panning"] = None
+                    return
+            for rect, key, field, maxv in state.get("slider_rects", []):
+                x0, y0, x1, y1 = rect
+                if x0 - 8 <= x <= x1 + 8 and y0 - 8 <= py <= y1 + 8:
+                    state["dragging"] = (key, field, maxv, x0, x1)
+                    val = round((x - x0) / max(x1 - x0, 1) * maxv)
+                    config[key][field] = int(max(0, min(maxv, val)))
+                    return
+            state["panning"] = (y, state.get("scroll_y", 0))
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if state.get("dragging"):
+                key, field, maxv, x0, x1 = state["dragging"]
+                val = round((x - x0) / max(x1 - x0, 1) * maxv)
+                config[key][field] = int(max(0, min(maxv, val)))
+            elif state.get("panning"):
+                start_y, start_scroll = state["panning"]
+                max_scroll = state.get("max_scroll", 0)
+                state["scroll_y"] = int(max(0, min(max_scroll, start_scroll + (start_y - y))))
+        elif event == cv2.EVENT_LBUTTONUP:
+            state["dragging"] = None
+            state["panning"] = None
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            max_scroll = state.get("max_scroll", 0)
+            step = 40
+            delta = step if flags > 0 else -step
+            state["scroll_y"] = int(max(0, min(max_scroll, state.get("scroll_y", 0) - delta)))
+    return on_mouse
 
 
 def parse_source(value):
@@ -223,7 +385,13 @@ def main():
     parser.add_argument("--config", default="hsv_config.json", help="file konfigurasi HSV")
     args = parser.parse_args()
 
-    cap = cv2.VideoCapture(parse_source(args.source))
+    source = parse_source(args.source)
+    cameras = probe_cameras()
+    if isinstance(source, int) and source not in cameras:
+        cameras = sorted(cameras + [source])
+    cam_index = source if isinstance(source, int) else -1
+
+    cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise SystemExit(f"Gagal membuka sumber: {args.source}")
 
@@ -231,24 +399,54 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
 
     config = load_config(args.config)
-    create_controls(config)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    window = "Segmentasi Merah & Biru"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    show_mask = False
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.resizeWindow(WINDOW, 1600, 940)
+    tab_state = {
+        "active_tab": 0,
+        "width": max(args.width, 1),
+        "config": config,
+        "dragging": None,
+        "panning": None,
+        "slider_rects": [],
+        "cam_rects": [],
+        "scroll_y": 0,
+        "max_scroll": 0,
+        "cam_index": cam_index,
+        "cameras": cameras,
+        "requested_source": None,
+    }
+    cv2.setMouseCallback(WINDOW, make_tab_callback(tab_state))
     last_time = time.time()
     fps = 0.0
 
     while True:
+        if tab_state.get("requested_source") is not None:
+            new_src = tab_state["requested_source"]
+            tab_state["requested_source"] = None
+            if new_src != source:
+                cap.release()
+                cap = cv2.VideoCapture(new_src)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+                source = new_src
+                tab_state["cam_index"] = new_src if isinstance(new_src, int) else -1
+
         ok, frame = cap.read()
         if not ok:
-            break
+            if isinstance(source, str):
+                break
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or args.height or 480)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or args.width or 640)
+            frame = np.zeros((max(h, 1), max(w, 1), 3), dtype=np.uint8)
+            cv2.putText(frame, f"Gagal membaca kamera: {source}", (30, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
         if not args.no_flip:
             frame = cv2.flip(frame, 1)
 
-        config = read_controls()
+        config = tab_state["config"]
         red_ranges = hsv_ranges(
             config["merah"]["center"],
             config["merah"]["width"],
@@ -280,8 +478,27 @@ def main():
             cv2.LINE_AA,
         )
 
-        display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if show_mask else result
-        cv2.imshow(window, display)
+        if tab_state["active_tab"] == 1:
+            panel, rects, cam_rects, max_scroll = draw_tuning_panel(
+                result.shape[1],
+                result.shape[0],
+                config,
+                tab_state.get("scroll_y", 0),
+                tab_state.get("cam_index", -1),
+                tab_state.get("cameras", []),
+            )
+            tab_state["slider_rects"] = rects
+            tab_state["cam_rects"] = cam_rects
+            tab_state["max_scroll"] = max_scroll
+            if tab_state.get("scroll_y", 0) > max_scroll:
+                tab_state["scroll_y"] = max_scroll
+            view = panel
+        else:
+            tab_state["slider_rects"] = []
+            tab_state["cam_rects"] = []
+            view = result
+        tab_state["width"] = view.shape[1]
+        cv2.imshow(WINDOW, draw_tabs(view, tab_state["active_tab"]))
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
@@ -291,7 +508,7 @@ def main():
             cv2.imwrite(filename, result)
             print(f"Disimpan: {filename}")
         if key == ord("m"):
-            show_mask = not show_mask
+            tab_state["active_tab"] = 1 - tab_state["active_tab"]
         if key == ord("p"):
             save_config(args.config, config)
 
